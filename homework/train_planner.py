@@ -138,7 +138,7 @@ def validate_epoch(model, loader, device):
 
 
 
-def planner_loss_smoothl1(pred, target, mask=None, *, lat_budget=0.6, long_budget=0.2, beta=1.0):
+def planner_loss_smoothl1(pred, target, mask=None, *, lat_budget=0.4, long_budget=0.2, beta=1.0):
     """
     pred, target: (B, 3, 2) in ego frame  ->  [:, :, 0]=lateral (x), [:, :, 1]=longitudinal (z)
     mask: (B, 3) bool, True = valid waypoint (unmasked)
@@ -274,10 +274,6 @@ def main():
             if stale >= patience:
                 print(f"Early stopping at epoch {epoch+1} (best val loss: {best_val:.4f})")
                 break
-
-    # --- save ---
-    save_model(model)
-    print("Training complete. Model saved as model_stk.pth")
 
 
 
