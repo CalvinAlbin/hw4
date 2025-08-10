@@ -2,10 +2,31 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.Functional as F
 
 HOMEWORK_DIR = Path(__file__).resolve().parent
 INPUT_MEAN = [0.2788, 0.2657, 0.2629]
 INPUT_STD = [0.2064, 0.1944, 0.2252]
+
+
+
+
+
+class Residual(nn.Module):
+    def __init__(self, dim, p_drop=0.1):
+        super().__init__()
+        self.fc1 = nn.Linear(dim, dim)
+        self.fc2 = nn.Linear(dim, dim)
+        #Dropping random activations
+        self.drop = nn.Dropout(p_drop)
+
+    def forward(self, x):                 # x: (B, H)
+        h = nn.Functional.relu(self.fc1(x))           # (B, H)
+        h = self.drop(h)                  # (B, H)
+        h = self.fc2(h)                   # (B, H)
+        return nn.Functional.relu(x + h)              # (B, H)
+
+
 
 
 class MLPPlanner(nn.Module):
@@ -13,7 +34,8 @@ class MLPPlanner(nn.Module):
         self,
         n_track: int = 10,
         n_waypoints: int = 3,
-        hidden_1: int = 32
+        hidden: int = 64,
+        p_drop: float = 0.1
     ):
         """
         Args:
@@ -25,16 +47,25 @@ class MLPPlanner(nn.Module):
         self.n_track = n_track
         self.n_waypoints = n_waypoints
 
-        #number of hidden layers in the first fully connected layer
-        self.n_hidden_1 = 32
-        #we get 10 points with 2 dimensions on 2 sides
-        self.in_dim = n_track * 2 * 2
-        #we return 3 waypoints in 2 dimensions
-        self.out_dim = n_waypoints * 2
+        #dimensions
+        in_dim  = n_track * 2 * 2         # 10*2*2 = 40  (left+right, x/z)
+        out_dim = n_waypoints * 2         # 3*2 = 6
 
-        #defining layers of model
-        self.fc1 = nn.Linear(self.in_dim, hidden_1)
-        self.fc2 = nn.Linear(hidden_1, self.out_dim)
+        # (1) input stabilization
+        self.in_norm = nn.LayerNorm(in_dim)
+
+        # stem
+        self.fc_in = nn.Linear(in_dim, hidden)
+
+        #two residual blocks, each containing 2 layers
+        self.block1 = Residual(hidden, p_drop=p_drop)
+        self.block2 = Residual(hidden, p_drop=p_drop)
+
+        # head
+        self.fc_out = nn.Linear(hidden, out_dim)
+
+        # input bypass (linear shortcut input -> output)
+        self.bypass = nn.Linear(in_dim, out_dim)
 
 
 
@@ -68,15 +99,23 @@ class MLPPlanner(nn.Module):
 
 
         #-------------Pass Data Through Model------------------------------------------
-        #First Layer
-        x = self.fc1(x)
-        #Relu
-        x = nn.functional.relu(x)
-        #Output Layer
-        x = self.fc2(x)
+        # #First Layer
+        # x = self.fc1(x)
+        # #Relu
+        # x = nn.functional.relu(x)
+        # #Output Layer
+        # x = self.fc2(x)
 
-        #reshaping the output to be (B, 3, 2)
-        return x.view(B, self.n_waypoints, 2)
+        # #reshaping the output to be (B, 3, 2)
+        # return x.view(B, self.n_waypoints, 2)
+    
+        x_n = self.in_norm(x)             # (B, 40)
+        h   = F.relu(self.fc_in(x_n))     # (B, 64)
+        h   = self.block1(h)              # (B, 64)
+        h   = self.block2(h)              # (B, 64)
+
+        y_hat = self.fc_out(h) + self.bypass(x_n)  # (B, 6)
+        return y_hat.view(B, 3, 2)        # (B, 3, 2)
 
 
 
