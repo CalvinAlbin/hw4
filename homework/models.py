@@ -24,7 +24,7 @@ class Residual(nn.Module):
         h = F.relu(self.fc1(x))           # (B, H)
         h = self.drop(h)                  # (B, H)
         h = self.fc2(h)                   # (B, H)
-        return nn.Functional.relu(x + h)              # (B, H)
+        return F.relu(x + h)              # (B, H)
 
 
 
