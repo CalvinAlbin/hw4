@@ -2,7 +2,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-import torch.nn.Functional as F
+import torch.nn.functional as F
 
 HOMEWORK_DIR = Path(__file__).resolve().parent
 INPUT_MEAN = [0.2788, 0.2657, 0.2629]
