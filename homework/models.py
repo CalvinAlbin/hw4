@@ -135,14 +135,110 @@ class TransformerPlanner(nn.Module):
         self,
         n_track: int = 10,
         n_waypoints: int = 3,
-        d_model: int = 64,
+        d_model: int = 128,
+        num_heads: int = 8,
+        dropout: float = 0.1,
     ):
         super().__init__()
-
         self.n_track = n_track
         self.n_waypoints = n_waypoints
+        self.d_model = d_model
 
-        self.query_embed = nn.Embedding(n_waypoints, d_model)
+
+        # turn coords (x,z) into d-dim features
+        self.coord_proj = nn.Linear(2, d_model)              # (...,2) -> (...,d)
+
+
+        # embeddings for position (0..T-1) and side (0=left, 1=right)
+        self.pos_emb  = nn.Embedding(n_track, d_model)       # (10, d)
+        self.side_emb = nn.Embedding(2, d_model)             # (2, d)
+
+
+        # learned queries (one per waypoint)
+        self.query_emb = nn.Embedding(n_waypoints, d_model)  # (3, d)
+
+
+        # --- layer norms (pre-activations)
+        self.tokens_ln  = nn.LayerNorm(d_model)
+        self.queries_ln = nn.LayerNorm(d_model)
+
+
+        # single cross-attention layer (queries attend over tokens)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=d_model, num_heads=num_heads, batch_first=True
+        )
+        self.attn_drop = nn.Dropout(dropout)
+
+
+        # --- small FFN with residual
+        #Mixing the features within the tokens
+        self.ffn_fc1 = nn.Linear(d_model, 2 * d_model)
+        self.ffn_fc2 = nn.Linear(2 * d_model, d_model)
+        self.ffn_drop = nn.Dropout(dropout)
+
+
+        # --- post-block norms
+        self.post_attn_ln = nn.LayerNorm(d_model)
+        self.post_ffn_ln  = nn.LayerNorm(d_model)
+
+
+        # map per-query features to (x,z)
+        self.head = nn.Linear(d_model, 2)
+
+
+    def _make_tokens(self, left, right):
+            #take the ground truth left right tensors, combine them, expand them to d dimensions
+            #   create position id's for each token at side and position level, embed(lookup) the
+            #   d size vector for each token's relative side and position, then comibne them
+            #   with the coordinate vectors to get the final tokens which are used to create the
+            #   keys and values which the queries use in the attention algorithm to make decisions
+            #   the queries score each token based on keys, then compute weights using the softmax
+            #   of the scores, then mix the values and weights which come together using the final
+            #   simple layer to form a prediction for the query!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+            #   !!!!!!!!!!!!!!!!!!!! GOD THESE TRANSFORMERS ARE GOING TO KILL ME!!!!!!!!!!!!!!!!!!!!
+            # left,right: (B,10,2)
+            B, T, _ = left.shape
+            device = left.device
+
+            # 1) concat left then right
+            tokens_2d = torch.cat([left, right], dim=1)          # (B, 20, 2)
+
+            # 2) project coords
+            coord_feat = self.coord_proj(tokens_2d)              # (B, 20, d)
+
+            # 3) position ids: [0..T-1, 0..T-1]
+            pos = torch.arange(T, device=device)                 # (10,)
+            pos_ids = torch.cat([pos, pos], dim=0)               # (20,)
+            pos_ids = pos_ids.unsqueeze(0).expand(B, -1)         # (B, 20)
+
+            # 4) side ids: [0...0, 1...1]
+            left_side  = torch.zeros(B, T, dtype=torch.long, device=device)
+            right_side = torch.ones (B, T, dtype=torch.long, device=device)
+            side_ids = torch.cat([left_side, right_side], dim=1) # (B, 20)
+
+            # 5) add embeddings
+            pos_vecs  = self.pos_emb(pos_ids)                    # (B, 20, d)
+            side_vecs = self.side_emb(side_ids)                  # (B, 20, d)
+            tokens = coord_feat + pos_vecs + side_vecs           # (B, 20, d)
+
+            # 6) normalize
+            tokens = self.tokens_ln(tokens)                      # (B, 20, d)
+            return tokens
+
+
+
+    def _make_queries(self, B, device):
+        #Each query gets its own ID, which is then embedded (they lookup their corresponding
+        #   set of features) which gets expanded across all batches, which then gets layer normalized.
+        # 1) ids 0..W-1
+        q_ids = torch.arange(self.n_waypoints, device=device)  # (3,)
+        # 2) lookup
+        q = self.query_emb(q_ids)                              # (3, d)
+        # 3) batch expand
+        q = q.unsqueeze(0).expand(B, -1, -1)                   # (B, 3, d)
+        # 4) normalize
+        q = self.queries_ln(q)                                 # (B, 3, d)
+        return q
 
     def forward(
         self,
@@ -163,7 +259,38 @@ class TransformerPlanner(nn.Module):
         Returns:
             torch.Tensor: future waypoints with shape (b, n_waypoints, 2)
         """
-        raise NotImplementedError
+        # inputs: (B,T,2)
+        B = track_left.size(0)
+        device = track_left.device
+
+        # --- make K,V and Q
+        tokens = self._make_tokens(track_left, track_right)    # (B, 20, d)
+        queries = self._make_queries(B, device)                # (B, 3, d)
+
+        # --- cross-attention (residual)
+        #                       queries, keys,   values
+        attn_out, _ = self.attn(queries, tokens, tokens)       # (B, 3, d)
+        x = queries + self.attn_drop(attn_out)                 # (B, 3, d)
+        x = self.post_attn_ln(x)                               # (B, 3, d)
+
+        # --- FFN (residual)
+        h = self.ffn_fc1(x)                                    # (B, 3, 2d)
+        h = F.relu(h)                                          # (B, 3, 2d)
+        h = self.ffn_drop(h)                                   # (B, 3, 2d)
+        h = self.ffn_fc2(h)                                    # (B, 3, d)
+        x = self.post_ffn_ln(x + self.ffn_drop(h))             # (B, 3, d)
+
+        # --- head: per-query to (x,z)
+        out = self.head(x)                                     # (B, 3, 2)
+        return out
+
+
+
+
+
+
+
+
 
 
 class CNNPlanner(torch.nn.Module):
@@ -172,11 +299,36 @@ class CNNPlanner(torch.nn.Module):
         n_waypoints: int = 3,
     ):
         super().__init__()
-
         self.n_waypoints = n_waypoints
 
         self.register_buffer("input_mean", torch.as_tensor(INPUT_MEAN), persistent=False)
         self.register_buffer("input_std", torch.as_tensor(INPUT_STD), persistent=False)
+
+
+        # Block 1: (B, 3, 96, 128) -> (B, 32, 48, 64) down
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1)
+        self.bn1   = nn.BatchNorm2d(32)
+
+        # Block 2: (B, 32, 48, 64) -> (B, 64, 24, 32) down
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1)
+        self.bn2   = nn.BatchNorm2d(64)
+
+        # Block 3: (B, 64, 24, 32) -> (B, 128, 12, 16) up
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1)
+        self.bn3   = nn.BatchNorm2d(128)
+
+        # Block 4: (B, 128, 12, 16) -> (B, 128, 6, 8) 
+        self.conv4 = nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1)
+        self.bn4   = nn.BatchNorm2d(128)
+
+        # Global average pool: (B, 128, 6, 8) -> (B, 128, 1, 1)
+        self.gap   = nn.AdaptiveAvgPool2d((1, 1))
+
+        # Head: 128 -> (n_waypoints * 2)
+        self.fc    = nn.Linear(128, n_waypoints * 2)
+
+        # (optional) tiny dropout for regularization
+        self.drop  = nn.Dropout(p=0.1)
 
     def forward(self, image: torch.Tensor, **kwargs) -> torch.Tensor:
         """
@@ -189,7 +341,44 @@ class CNNPlanner(torch.nn.Module):
         x = image
         x = (x - self.input_mean[None, :, None, None]) / self.input_std[None, :, None, None]
 
-        raise NotImplementedError
+        # image: (B, 3, 96, 128)
+        x = F.relu(self.bn1(self.conv1(image)))   # (B, 32, 48, 64)
+        x = F.relu(self.bn2(self.conv2(x)))       # (B, 64, 24, 32)
+        x = F.relu(self.bn3(self.conv3(x)))       # (B,128, 12, 16)
+        x = F.relu(self.bn4(self.conv4(x)))       # (B,128,  6,  8)
+
+        x = self.gap(x)                           # (B,128,1,1)
+        x = torch.flatten(x, 1)                   # (B,128)
+        x = self.drop(x)                          # (B,128)
+
+        x = self.fc(x)                            # (B, n_waypoints*2)
+        out = x.view(x.size(0), self.n_waypoints, 2)  # (B, n_waypoints, 2)
+        return out
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 MODEL_FACTORY = {

@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.optim
 import torch.nn.functional as F
 import numpy as np
-from homework.models import MLPPlanner, save_model, load_model
+from homework.models import MLPPlanner, TransformerPlanner, CNNPlanner, save_model, load_model
 from homework.datasets.road_dataset import load_data
 
 
@@ -20,7 +20,9 @@ def train_epoch(
         loader,
         optimizer,
         device,
-        grad_clip=1.0
+        grad_clip=1.0,
+        lat_budget=0.6, 
+        long_budget=0.2,
 ):
     
 
@@ -41,12 +43,13 @@ def train_epoch(
         mask  = batch["waypoints_mask"].to(device).bool()   # (B, 3)
 
         #Forwards pass through the model
-        pred = model(left, right)                     # (B, 3, 2)
+        #pred = model(left, right)                     # (B, 3, 2)
+        pred = model(batch["image"].to(device))
 
         #Calculating loss using smoothL1 loss function defined later
         loss, logs = planner_loss_smoothl1(
             pred, target, mask=mask,
-            lat_budget=0.6, long_budget=0.2, beta=1.0
+            lat_budget=lat_budget, long_budget=long_budget, beta=1.0
         )
 
         #Backpropogation and parameter update
@@ -84,7 +87,7 @@ def train_epoch(
 
 
 @torch.no_grad()
-def validate_epoch(model, loader, device):
+def validate_epoch(model, loader, device, lat_budget=0.6, long_budget=0.2,):
     """
     Expects batch keys:
       'track_left'     : (B, 10, 2)
@@ -110,12 +113,13 @@ def validate_epoch(model, loader, device):
         mask   = batch["waypoints_mask"].to(device).bool()  # (B, 3)
 
         #forwards pass
-        pred = model(left, right)                        # (B, 3, 2)
+        #pred = model(left, right)                        # (B, 3, 2)
+        pred = model(batch["image"].to(device))
 
         #calculating loss
         loss, logs = planner_loss_smoothl1(
             pred, target, mask=mask,
-            lat_budget=0.6, long_budget=0.2, beta=1.0
+            lat_budget=lat_budget, long_budget=long_budget, beta=1.0
         )
 
         #storing metrics per batch
@@ -138,7 +142,7 @@ def validate_epoch(model, loader, device):
 
 
 
-def planner_loss_smoothl1(pred, target, mask=None, *, lat_budget=0.4, long_budget=0.2, beta=1.0):
+def planner_loss_smoothl1(pred, target, mask=None, *, lat_budget=0.6, long_budget=0.2, beta=1.0):
     """
     pred, target: (B, 3, 2) in ego frame  ->  [:, :, 0]=lateral (x), [:, :, 1]=longitudinal (z)
     mask: (B, 3) bool, True = valid waypoint (unmasked)
@@ -201,8 +205,10 @@ def main():
     train_data_dir = "drive_data/train"
     val_data_dir = "drive_data/val"
     batch_size = 64
-    num_epochs = 10
+    num_epochs = 20
     seed = 2024
+    lat_budget = 0.6
+    long_budget = 0.5
 
     # set random seed so each run is deterministic
     torch.manual_seed(seed)
@@ -225,35 +231,37 @@ def main():
     #Using state only so that we dont load image data that we dont need. We are training only on the ground truth values.
         # --- data (state_only = no images) ---
     train_loader = load_data(
-        train_data_dir, transform_pipeline="state_only",
+        train_data_dir, transform_pipeline="default",
         return_dataloader=True, num_workers=2,
         batch_size=batch_size, shuffle=True
     )
     val_loader = load_data(
-        val_data_dir, transform_pipeline="state_only",
+        val_data_dir, transform_pipeline="default",
         return_dataloader=True, num_workers=2,
         batch_size=batch_size, shuffle=False  
     )
 
 
     #model and optimizer
-    model = MLPPlanner().to(device)
+    model = CNNPlanner().to(device)
     #loss_fn = planner_loss_smoothl1()
     optimizer = torch.optim.AdamW(model.parameters(), lr = 1e-3,  weight_decay=1e-4)
+    
 
+    
 
 
     # before the loop
     best_val = float("inf")
-    patience = 3          # epochs with no improvement allowed
+    patience = 10          # epochs with no improvement allowed
     min_delta = 0.0       # require this much improvement to reset patience
     stale = 0
 
     #training and validation
     #using early stopping to prevent overfitting
     for epoch in range(num_epochs):
-        train_stats = train_epoch(model, train_loader, optimizer, device, grad_clip=1.0)
-        val_stats   = validate_epoch(model, val_loader, device)
+        train_stats = train_epoch(model, train_loader, optimizer, device, grad_clip=1.0, lat_budget=lat_budget, long_budget=long_budget)
+        val_stats   = validate_epoch(model, val_loader, device, lat_budget=lat_budget, long_budget=long_budget)
 
         print(
             f"Epoch {epoch+1}/{num_epochs} | "
@@ -262,6 +270,12 @@ def main():
             f"Val:   loss {val_stats['loss']:.4f}, "
             f"lat {val_stats['lat_mae']:.4f}, long {val_stats['long_mae']:.4f}"
         )
+
+        #stopping if it validates well enough
+        if val_stats["lat_mae"] < 0.6 and val_stats["long_mae"] < 0.2:
+            save_model(model) 
+            print(f"Early stopping at epoch {epoch+1} (best val loss: {best_val:.4f})")
+            break
 
         # early stopping on validation loss
         val_metric = val_stats["loss"]
